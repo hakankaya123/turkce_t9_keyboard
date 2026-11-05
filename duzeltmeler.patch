@@ -1,0 +1,2206 @@
+diff --git a/.gitignore b/.gitignore
+index aa724b7..aefe15f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,3 +13,8 @@
+ .externalNativeBuild
+ .cxx
+ local.properties
++
++# İmzalı release çıktıları repoya girmemeli
++/app/release/
++*.apk
++*.aab
+diff --git a/README.md b/README.md
+index 56fa54c..7bd29bc 100644
+--- a/README.md
++++ b/README.md
+@@ -44,9 +44,17 @@ Her adımın yanında durum görünür (✓ Etkin / ✓ Seçildi).
+ | Dosya | Görevi |
+ |---|---|
+ | `MainActivity.kt` | Açılış ekranı, kurulum adımları ve özellik tanıtımı |
+-| `T9Service.kt` | Klavye servisi (giriş yöntemi) |
++| `T9Service.kt` | Klavye servisi (giriş yöntemi): tuş akışı, arayüz sayfaları, öneri çubuğu |
++| `DictData.kt` | Sözlük verisi: temel kelimeler, kullanıcı kelimeleri, bigram/harf istatistikleri |
++| `T9Trie.kt` | Tuş kodundan kelime bulan bellek dostu T9 ağacı |
++| `T9Keymap.kt` | Türkçe T9 tuş eşlemesi ve kelime → tuş kodu dönüşümü (saf, test edilebilir) |
++| `DefaultDictionary.kt` | Sözlük dosyaları okunamazsa kullanılan yedek kelimeler |
++| `BinaryDictionaryReader.kt` | `words_tr.bin` okuyucusu |
++| `ClipManager.kt` | Pano dinleme ve hassas içeriği filtreleme |
+ | `ClipStore.kt` | Pano geçmişinin saklanması |
+ | `ClipEditActivity.kt` | Pano kartı oluşturma, düzenleme, kilitleme ve silme penceresi |
++| `UserDictionaryActivity.kt` / `UserDictionaryStore.kt` | Kullanıcı sözlüğü ekranı ve saklaması |
++| `IconView.kt` / `JoystickView.kt` | Çizilen tuş ikonları ve joystick görünümü |
+ 
+ ## Katkıda Bulunma
+ 
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index ca83754..c016fda 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -37,6 +37,7 @@ dependencies {
+     implementation(libs.androidx.appcompat)
+     implementation(libs.androidx.constraintlayout)
+     implementation(libs.androidx.core.ktx)
++    implementation(libs.kotlinx.coroutines.android)
+     implementation(libs.material)
+     testImplementation(libs.junit)
+     androidTestImplementation(libs.androidx.espresso.core)
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index ad02db5..35ed5e4 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -42,14 +42,14 @@
+             android:name=".ClipEditActivity"
+             android:exported="false"
+             android:icon="@mipmap/ic_launcher"
+-            android:label="Pano kartı"
++            android:label="@string/clip_edit_title"
+             android:theme="@android:style/Theme.DeviceDefault.Light.Dialog" />
+ 
+         <activity
+             android:name=".UserDictionaryActivity"
+             android:exported="false"
+             android:icon="@mipmap/ic_launcher"
+-            android:label="Kullanıcı Sözlüğü"
++            android:label="@string/user_dictionary_title"
+             android:windowSoftInputMode="adjustResize" />
+ 
+     </application>
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/ClipManager.kt b/app/src/main/java/com/example/comexamplet9keyboard/ClipManager.kt
+new file mode 100644
+index 0000000..d4968ed
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/ClipManager.kt
+@@ -0,0 +1,88 @@
++package com.example.comexamplet9keyboard
++
++import android.content.ClipboardManager
++import android.content.Context
++import android.text.InputType
++import android.util.Log
++import android.view.inputmethod.EditorInfo
++
++/**
++ * Panoyu dinler ve kopyalanan metni ClipStore'a yazar.
++ * Hassas kaynaklardan (şifre alanları, şifre yöneticileri, IS_SENSITIVE bayrağı) gelen içerik kaydedilmez.
++ */
++class ClipManager(
++    private val context: Context,
++    private val currentEditorInfo: () -> EditorInfo?
++) {
++    private var lastClip: String? = null
++    private val clipboard by lazy { context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
++    private val listener = ClipboardManager.OnPrimaryClipChangedListener { capture(true) }
++
++    fun start() {
++        try {
++            clipboard.addPrimaryClipChangedListener(listener)
++        } catch (e: Exception) {
++            Log.w(TAG, "Pano dinleyicisi eklenemedi", e)
++        }
++    }
++
++    fun stop() {
++        try {
++            clipboard.removePrimaryClipChangedListener(listener)
++        } catch (e: Exception) {
++            Log.w(TAG, "Pano dinleyicisi kaldırılamadı", e)
++        }
++    }
++
++    // Kopyalama sırasında klavyenin bağlı olduğu alan şifre türündeyse veya uygulama bilinen bir
++    // şifre yöneticisiyse pano geçmişine alınmaz. (ClipDescription kaynak paketini vermez; bu en iyi tahmindir.)
++    private fun sourceLooksSensitive(): Boolean {
++        val info = currentEditorInfo() ?: return false
++        if (info.packageName in SENSITIVE_PACKAGES) return true
++        val t = info.inputType
++        if ((t and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT) {
++            when (t and InputType.TYPE_MASK_VARIATION) {
++                InputType.TYPE_TEXT_VARIATION_PASSWORD,
++                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
++                InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> return true
++            }
++        }
++        if ((t and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_NUMBER &&
++            (t and InputType.TYPE_MASK_VARIATION) == InputType.TYPE_NUMBER_VARIATION_PASSWORD
++        ) return true
++        return false
++    }
++
++    fun capture(force: Boolean) {
++        try {
++            val c = clipboard.primaryClip ?: return
++            if (c.itemCount == 0) return
++            if (c.description?.extras?.getBoolean(
++                    "android.content.extra.IS_SENSITIVE",
++                    false
++                ) == true
++            ) return
++            if (sourceLooksSensitive()) return
++            val t = c.getItemAt(0).coerceToText(context)?.toString() ?: return
++            if (!force && t == lastClip) return
++            lastClip = t
++            if (t.isNotBlank() && t.length <= 5000) ClipStore.add(context, t)
++        } catch (e: Exception) {
++            Log.w(TAG, "Pano içeriği okunamadı", e)
++        }
++    }
++
++    private companion object {
++        const val TAG = "ClipManager"
++
++        // Bu uygulamalardan kopyalanan metinler pano geçmişine kaydedilmez.
++        val SENSITIVE_PACKAGES = setOf(
++            "com.x8bit.bitwarden", "com.bitwarden.authenticator",
++            "com.onepassword.android", "com.agilebits.onepassword",
++            "com.lastpass.lpandroid", "com.dashlane",
++            "org.keepassdroid", "com.kunzisoft.keepass.free", "com.kunzisoft.keepass.libre",
++            "keepass2android.keepass2android", "org.proton.pass", "me.proton.android.pass",
++            "com.google.android.apps.authenticator2", "com.authy.authy", "com.nordpass.android.app.password.manager"
++        )
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/DefaultDictionary.kt b/app/src/main/java/com/example/comexamplet9keyboard/DefaultDictionary.kt
+new file mode 100644
+index 0000000..c929892
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/DefaultDictionary.kt
+@@ -0,0 +1,40 @@
++package com.example.comexamplet9keyboard
++
++// Sözlük dosyaları okunamazsa kullanılan yedek veriler.
++object DefaultDictionary {
++    const val BIGRAMS =
++        "merhaba:nasılsın,hoş,canım;selam:nasılsın,canım;nasılsın:iyiyim,nasıl;" +
++                "nereye:gidiyorsun,gidiyoruz,gidiyor;nerede:buluşuyoruz,kaldın;neredesin:ben,şimdi;" +
++                "ne:yapıyorsun,zaman,var,yaptın;nasıl:gidiyor,bir,yani;teşekkür:ederim,ederiz;" +
++                "sağ:ol;iyi:akşamlar,geceler,günler,misin;günaydın:canım,nasılsın;hoş:geldin,bulduk;" +
++                "görüşürüz:canım,kendine;kendine:iyi;çok:güzel,teşekkürler,iyi;bir:şey,saniye,dakika;" +
++                "ben:de,şimdi,geliyorum;sen:de,nerdesin;bugün:ne,nasıl,akşam;yarın:görüşürüz,görüşelim,sabah;" +
++                "tamam:canım,olur,görüşürüz;lütfen:bana,beni;özür:dilerim;şimdi:geliyorum,müsait,gidiyorum;" +
++                "evet:tabii,kesinlikle,ben;hayır:değil,olmaz;aşkım:nasılsın,ne;canım:benim,nasılsın"
++
++    const val WORDS =
++        "bir bu ve da de için ne çok ama daha var gibi ben sen o biz siz onlar evet hayır " +
++                "değil mi ki en kadar sonra şimdi nasıl neden nerede nereye nereden kim kime hangi şey her hiç bile " +
++                "ile ya ise çünkü yani tamam merhaba selam nasılsın iyiyim teşekkürler teşekkür ederim sağol rica " +
++                "lütfen özür dilerim günaydın akşamlar geceler hoş geldin görüşürüz hadi haydi bak bakalım olur " +
++                "olmaz olmuş oldu olacak olarak olan gel gelmek geliyorum geliyor geldi gelecek git gitmek " +
++                "gidiyorum gidiyorsun gidiyor gidiyoruz gitti gideceğim yap yapmak yapıyorum yapıyorsun yaptım " +
++                "yapacağım ver vermek al almak bul bulmak söyle söylemek biliyorum bilmiyorum biliyor istiyorum " +
++                "istiyorsun istiyor istemiyorum sevgilim canım aşkım güzel kötü iyi büyük küçük yeni eski bugün " +
++                "yarın dün şu an akşam sabah öğle gece hafta ay yıl saat dakika zaman gün ev iş okul araba yol " +
++                "para su yemek çay kahve ekmek telefon mesaj arıyorum arıyorsun arayacağım ara görmek görüyorum " +
++                "gördüm göreceğim bekle bekliyorum bekliyor geliyorsun nerdesin neredesin yapıyorsun napıyorsun " +
++                "kaç kaçta nerde burada orada şurada buraya oraya bana sana ona bize size onlara benim senin onun " +
++                "bizim sizin onların beni seni onu bizi sizi onları benimle seninle onunla bizimle sizinle " +
++                "müsait müsaitsin buluşalım buluşuruz buluşuyoruz kaldın kaldım yoldayım yoldayız geç geç kaldım " +
++                "erken geç acil önemli sorun yok var mı tabii tabi kesinlikle belki galiba sanırım herhalde " +
++                "aslında özellikle sadece bile hem hem de veya ya da fakat ancak üzgünüm mutlu mutluyum yorgunum " +
++                "acıktım susadım uyuyorum uyudum uyanık hasta iyileş geçmiş olsun doğum günü kutlu olsun " +
++                "bayram tebrik ederim kolay zor güzel güzeldi harika süper mükemmel berbat fena değil " +
++                "anne baba kardeş abi abla amca teyze dayı hala arkadaş dost eş çocuk bebek aile " +
++                "toplantı ders sınav ödev proje rapor dosya belge mail eposta mesajı gönder gönderdim " +
++                "göndereceğim aldım aldık verdim verdik yaptık yapalım gidelim gelelim bakalım konuşalım " +
++                "konuşuruz konuşuyoruz anlıyorum anladım anlamadım tekrar bir daha lütfen tekrar söyle " +
++                "doğru yanlış evet tamamdır peki olur mu olmuyor olabilir olmaz mı hayırlı olsun " +
++                "inşallah maşallah selamün aleyküm aleyküm selam allah'a emanet kendine iyi bak"
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/DictData.kt b/app/src/main/java/com/example/comexamplet9keyboard/DictData.kt
+new file mode 100644
+index 0000000..db09c7e
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/DictData.kt
+@@ -0,0 +1,165 @@
++package com.example.comexamplet9keyboard
++
++import android.content.Context
++import android.content.SharedPreferences
++import android.os.Handler
++import android.util.Log
++
++/**
++ * Sözlük verisi: temel kelime listesi (words_tr.bin / .txt), kullanıcı kelimeleri,
++ * bigram ve harf istatistikleri ile T9 ağacı. Servisten bağımsızdır; Context, SharedPreferences
++ * (tembel sağlayıcı olarak) ve ana iş parçacığı Handler'ı dışarıdan alır.
++ */
++class DictData(
++    private val context: Context,
++    private val prefsProvider: () -> SharedPreferences,
++    private val mainHandler: Handler
++) {
++    // Servis nesnesi oluşurken Context henüz bağlı olmadığından SharedPreferences ilk kullanımda alınır.
++    private val prefs: SharedPreferences get() = prefsProvider()
++
++    private companion object {
++        const val TAG = "DictData"
++    }
++
++    val words = ArrayList<String>()
++    val codes = ArrayList<String>()
++    val wordSet = HashSet<String>()
++    val builtinBigrams = HashMap<String, ArrayList<String>>()
++    val userCount = HashMap<String, Int>()
++    val suffixCount = HashMap<String, Int>()
++    val wordIdx = HashMap<String, Int>()
++    val bigram = HashMap<String, Int>()
++    val charTotal = HashMap<Char, Int>()
++    val userBigram = HashMap<String, HashMap<String, Int>>()
++    val userWords = HashSet<String>()
++
++    val t9Trie = T9Trie()
++    var uc = ""
++
++    fun addWord(w: String) {
++        if (w.isEmpty() || !w.all { T9Keymap.charToDigit.containsKey(it) }) return
++        if (!wordSet.add(w)) return
++        val index = words.size
++        wordIdx[w] = index
++        words.add(w)
++
++        val codeStr = T9Keymap.codeOf(w)
++        codes.add(codeStr)
++
++        t9Trie.insert(T9Code(codeStr), WordIndex(index))
++
++        addSuffixes(w)
++        addLetterStats(w)
++    }
++
++    private fun addSuffixes(w: String) {
++        for (len in 1..4) if (w.length > len) {
++            val k = w.takeLast(len)
++            suffixCount[k] = (suffixCount[k] ?: 0) + 1
++        }
++    }
++
++    private fun addLetterStats(w: String) {
++        var prev = '^'
++        for (c in w) {
++            val k = "$prev$c"
++            bigram[k] = (bigram[k] ?: 0) + 1
++            charTotal[prev] = (charTotal[prev] ?: 0) + 1
++            prev = c
++        }
++    }
++
++    fun loadBase() {
++        var loaded = false
++        try {
++            val binaryReader = BinaryDictionaryReader(context, "words_tr.bin")
++            if (binaryReader.open()) {
++                val entries = binaryReader.readAllEntries()
++                if (entries.isNotEmpty()) {
++                    // Sıralama frekansa göre (azalan). .bin zaten sıralı olduğundan sıra değişmez;
++                    // sortedByDescending kararlıdır, yani eşit frekanslarda dosya sırası korunur.
++                    entries.sortedByDescending { it.frequency }.forEach { addWord(it.word) }
++                    loaded = true
++                }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "Sözlük okunamadı", e)
++        }
++
++        if (!loaded) {
++            val list = ArrayList<Pair<String, Long>>()
++            var hasFreq = false
++            try {
++                context.assets.open("words_tr.txt").bufferedReader().useLines { ls ->
++                    ls.forEach { line ->
++                        val t = line.trim()
++                        if (t.isNotEmpty()) {
++                            val parts = t.split(' ', '\t', ',', ';').filter { it.isNotEmpty() }
++                            val f = parts.getOrNull(1)?.toLongOrNull()
++                            if (f != null) hasFreq = true
++                            list.add(parts[0].lowercase(T9Keymap.tr) to (f ?: 0L))
++                        }
++                    }
++                }
++            } catch (e: Exception) {
++                Log.w(TAG, "words_tr.txt okunamadı", e)
++            }
++            if (list.isNotEmpty()) {
++                val ordered = if (hasFreq) list.sortedByDescending { it.second } else list
++                ordered.forEach { addWord(it.first) }
++            } else {
++                Log.e(TAG, "Sözlük dosyaları okunamadı, yedek sözlük kullanılıyor")
++                mainHandler.post {
++                    android.widget.Toast.makeText(
++                        context,
++                        context.getString(R.string.dictionary_load_failed),
++                        android.widget.Toast.LENGTH_LONG
++                    ).show()
++                }
++                DefaultDictionary.WORDS.split(" ").forEach { addWord(it) }
++            }
++        }
++
++        DefaultDictionary.BIGRAMS.split(";").forEach { e ->
++            val p = e.split(":")
++            if (p.size == 2) builtinBigrams.getOrPut(p[0]) { ArrayList() }
++                .addAll(p[1].split(","))
++        }
++    }
++
++    fun loadUser(migrate: Boolean) {
++        try {
++            uc = prefs.getString("uc", "") ?: ""
++            uc.lines().forEach { l ->
++                val p = l.split('\t')
++                if (p.size == 2) {
++                    val c = p[1].toIntOrNull()
++                    if (c != null) {
++                        val builtin = migrate && wordSet.contains(p[0])
++                        userCount[p[0]] = c
++                        if (!builtin) {
++                            userWords.add(p[0]); addWord(p[0])
++                        }
++                    }
++                }
++            }
++            (prefs.getString("lc", "") ?: "").lines().forEach { l ->
++                val p = l.split('\t')
++                if (p.size == 2) {
++                    val c = p[1].toIntOrNull()
++                    if (c != null && !userCount.containsKey(p[0])) userCount[p[0]] = c
++                }
++            }
++            (prefs.getString("ub", "") ?: "").lines().forEach { l ->
++                val p = l.split('\t')
++                if (p.size == 3) {
++                    val c = p[2].toIntOrNull()
++                    if (c != null) userBigram.getOrPut(p[0]) { HashMap() }[p[1]] = c
++                }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "Kullanıcı sözlüğü yüklenemedi", e)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/IconView.kt b/app/src/main/java/com/example/comexamplet9keyboard/IconView.kt
+new file mode 100644
+index 0000000..182504f
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/IconView.kt
+@@ -0,0 +1,203 @@
++package com.example.comexamplet9keyboard
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Path
++import android.graphics.RectF
++import android.view.View
++import kotlin.math.min
++
++class IconView @JvmOverloads constructor(
++    context: Context,
++    private var kind: Int = 0,
++    private var iconColor: Int = Color.WHITE,
++    private var strokeWidthPx: Float = 4f
++) : View(context) {
++
++    companion object {
++        const val SHIFT_OFF = 0
++        const val SHIFT_ON = 1
++        const val SHIFT_CAPS = 2
++        const val ENTER = 3
++        const val MIC = 4
++        const val UP = 5
++        const val DOWN = 6
++        const val LEFT = 7
++        const val RIGHT = 8
++        const val SPACE = 9
++        const val CURSOR = 10
++    }
++
++    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.STROKE
++        strokeCap = Paint.Cap.ROUND
++        strokeJoin = Paint.Join.ROUND
++    }
++
++    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.FILL
++    }
++
++    private val path = Path()
++    private val tempRect = RectF()
++
++    fun setLook(kind: Int, color: Int) {
++        this.kind = kind
++        this.iconColor = color
++        invalidate()
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        super.onDraw(canvas)
++        strokePaint.color = iconColor
++        strokePaint.strokeWidth = strokeWidthPx
++        fillPaint.color = iconColor
++
++        val cx = width / 2f
++        val cy = height / 2f
++        val size =
++            min(width - paddingLeft - paddingRight, height - paddingTop - paddingBottom) * 0.5f
++        if (size <= 0f) return
++
++        when (kind) {
++            SHIFT_OFF -> {
++                path.reset()
++                path.moveTo(cx, cy - size * 0.5f)
++                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.45f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.45f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
++                path.close()
++                canvas.drawPath(path, strokePaint)
++            }
++
++            SHIFT_ON -> {
++                path.reset()
++                path.moveTo(cx, cy - size * 0.5f)
++                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.45f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.45f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
++                path.close()
++                canvas.drawPath(path, fillPaint)
++            }
++
++            SHIFT_CAPS -> {
++                path.reset()
++                path.moveTo(cx, cy - size * 0.5f)
++                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx + size * 0.18f, cy + size * 0.35f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.35f)
++                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
++                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
++                path.close()
++                canvas.drawPath(path, fillPaint)
++                canvas.drawLine(
++                    cx - size * 0.35f,
++                    cy + size * 0.5f,
++                    cx + size * 0.35f,
++                    cy + size * 0.5f,
++                    strokePaint
++                )
++            }
++
++            ENTER -> {
++                path.reset()
++                path.moveTo(cx + size * 0.35f, cy - size * 0.35f)
++                path.lineTo(cx + size * 0.35f, cy + size * 0.1f)
++                path.lineTo(cx - size * 0.3f, cy + size * 0.1f)
++                canvas.drawPath(path, strokePaint)
++                path.reset()
++                path.moveTo(cx - size * 0.1f, cy - size * 0.1f)
++                path.lineTo(cx - size * 0.3f, cy + size * 0.1f)
++                path.lineTo(cx - size * 0.1f, cy + size * 0.3f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            MIC -> {
++                tempRect.set(cx - size * 0.18f, cy - size * 0.45f, cx + size * 0.18f, cy + size * 0.1f)
++                canvas.drawRoundRect(tempRect, size * 0.18f, size * 0.18f, strokePaint)
++                tempRect.set(
++                    cx - size * 0.32f,
++                    cy - size * 0.15f,
++                    cx + size * 0.32f,
++                    cy + size * 0.25f
++                )
++                canvas.drawArc(tempRect, 0f, 180f, false, strokePaint)
++                canvas.drawLine(cx, cy + size * 0.25f, cx, cy + size * 0.45f, strokePaint)
++                canvas.drawLine(
++                    cx - size * 0.2f,
++                    cy + size * 0.45f,
++                    cx + size * 0.2f,
++                    cy + size * 0.45f,
++                    strokePaint
++                )
++            }
++
++            UP -> {
++                path.reset()
++                path.moveTo(cx - size * 0.35f, cy + size * 0.2f)
++                path.lineTo(cx, cy - size * 0.2f)
++                path.lineTo(cx + size * 0.35f, cy + size * 0.2f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            DOWN -> {
++                path.reset()
++                path.moveTo(cx - size * 0.35f, cy - size * 0.2f)
++                path.lineTo(cx, cy + size * 0.2f)
++                path.lineTo(cx + size * 0.35f, cy - size * 0.2f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            LEFT -> {
++                path.reset()
++                path.moveTo(cx + size * 0.2f, cy - size * 0.35f)
++                path.lineTo(cx - size * 0.2f, cy)
++                path.lineTo(cx + size * 0.2f, cy + size * 0.35f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            RIGHT -> {
++                path.reset()
++                path.moveTo(cx - size * 0.2f, cy - size * 0.35f)
++                path.lineTo(cx + size * 0.2f, cy)
++                path.lineTo(cx - size * 0.2f, cy + size * 0.35f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            SPACE -> {
++                path.reset()
++                path.moveTo(cx - size * 0.4f, cy - size * 0.15f)
++                path.lineTo(cx - size * 0.4f, cy + size * 0.15f)
++                path.lineTo(cx + size * 0.4f, cy + size * 0.15f)
++                path.lineTo(cx + size * 0.4f, cy - size * 0.15f)
++                canvas.drawPath(path, strokePaint)
++            }
++
++            CURSOR -> {
++                path.reset()
++                path.moveTo(cx - size * 0.15f, cy - size * 0.15f)
++                path.lineTo(cx, cy - size * 0.35f)
++                path.lineTo(cx + size * 0.15f, cy - size * 0.15f)
++                path.moveTo(cx - size * 0.15f, cy + size * 0.15f)
++                path.lineTo(cx, cy + size * 0.35f)
++                path.lineTo(cx + size * 0.15f, cy + size * 0.15f)
++                path.moveTo(cx - size * 0.15f, cy - size * 0.15f)
++                path.lineTo(cx - size * 0.35f, cy)
++                path.lineTo(cx - size * 0.15f, cy + size * 0.15f)
++                path.moveTo(cx + size * 0.15f, cy - size * 0.15f)
++                path.lineTo(cx + size * 0.35f, cy)
++                path.lineTo(cx + size * 0.15f, cy + size * 0.15f)
++                canvas.drawPath(path, strokePaint)
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/JoystickView.kt b/app/src/main/java/com/example/comexamplet9keyboard/JoystickView.kt
+new file mode 100644
+index 0000000..163d8aa
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/JoystickView.kt
+@@ -0,0 +1,36 @@
++package com.example.comexamplet9keyboard
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Paint
++import android.view.View
++import androidx.core.graphics.toColorInt
++import kotlin.math.min
++
++class JoystickView(context: Context) : View(context) {
++    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.FILL
++        color = "#2E3236".toColorInt()
++    }
++    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.STROKE
++        strokeWidth = 3f * context.resources.displayMetrics.density
++        color = "#5FD3C5".toColorInt()
++    }
++    private val knobPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.FILL
++        color = "#5FD3C5".toColorInt()
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        super.onDraw(canvas)
++        val cx = width / 2f
++        val cy = height / 2f
++        val radius = min(cx, cy) - strokePaint.strokeWidth
++        if (radius <= 0f) return
++
++        canvas.drawCircle(cx, cy, radius, bgPaint)
++        canvas.drawCircle(cx, cy, radius, strokePaint)
++        canvas.drawCircle(cx, cy, radius * 0.35f, knobPaint)
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/T9Keymap.kt b/app/src/main/java/com/example/comexamplet9keyboard/T9Keymap.kt
+new file mode 100644
+index 0000000..4c2795f
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/T9Keymap.kt
+@@ -0,0 +1,25 @@
++package com.example.comexamplet9keyboard
++
++import java.util.Locale
++
++/**
++ * Türkçe T9 tuş eşlemesi. Saf (Android'e bağımlı olmayan) olduğundan JVM testleriyle denenebilir.
++ */
++object T9Keymap {
++    val tr: Locale = Locale.forLanguageTag("tr-TR")
++
++    val groups: Map<Char, String> = mapOf(
++        '2' to "abcçâ", '3' to "def", '4' to "ghiığî", '5' to "jkl",
++        '6' to "mnoö", '7' to "pqrsş", '8' to "tuvüû", '9' to "wxyz"
++    )
++
++    val charToDigit: Map<Char, Char> =
++        groups.flatMap { (d, s) -> s.map { it to d } }.toMap()
++
++    /** Kelimenin tuş kodu; haritada olmayan karakterler '?' olur. Her çağrıda yeni StringBuilder kullanır (iş parçacığı güvenli). */
++    fun codeOf(w: String): String {
++        val sb = StringBuilder(w.length)
++        for (c in w) sb.append(charToDigit[c] ?: '?')
++        return sb.toString()
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/T9Service.kt b/app/src/main/java/com/example/comexamplet9keyboard/T9Service.kt
+index d50f840..8a3cb72 100644
+--- a/app/src/main/java/com/example/comexamplet9keyboard/T9Service.kt
++++ b/app/src/main/java/com/example/comexamplet9keyboard/T9Service.kt
+@@ -3,17 +3,12 @@
+ package com.example.comexamplet9keyboard
+ 
+ import android.annotation.SuppressLint
+-import android.content.ClipboardManager
+-import android.content.Context
+ import android.content.Intent
+-import android.graphics.Canvas
+ import android.graphics.Color
+-import android.graphics.Paint
+-import android.graphics.Path
+-import android.graphics.RectF
+ import android.graphics.drawable.GradientDrawable
+ import android.inputmethodservice.InputMethodService
+ import android.os.Build
++import android.util.Log
+ import android.os.Handler
+ import android.os.Looper
+ import android.os.SystemClock
+@@ -38,96 +33,19 @@ import androidx.core.view.ViewCompat
+ import androidx.core.view.WindowInsetsCompat
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Runnable
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+-import java.util.Locale
+ import androidx.core.content.edit
+ import kotlin.math.abs
+ import kotlin.math.ln
+ import kotlin.math.min
+ import androidx.core.view.isVisible
+ 
+-// ==========================================
+-// OPTİMİZE EDİLMİŞ RAM VE CPU DOSTU T9 TRIE
+-// ==========================================
+-@JvmInline
+-value class T9Code(val value: String)
+-
+-@JvmInline
+-value class WordIndex(val id: Int)
+-
+-class T9Trie {
+-    class Node {
+-        // HashMap nesne maliyetini önlemek için sabit 10 elemanlı dizi (0-9 tuşları)
+-        val children = arrayOfNulls<Node>(10)
+-
+-        // Boxing maliyetini önlemek için IntArray
+-        var candidateIndices = IntArray(0)
+-
+-        fun addIndex(index: Int) {
+-            if (!candidateIndices.contains(index)) {
+-                candidateIndices += index
+-            }
+-        }
+-    }
+-
+-    val root = Node()
+-
+-    fun insert(code: T9Code, wordIndex: WordIndex) {
+-        var curr = root
+-        val str = code.value
+-        for (ch in str) {
+-            val d = ch.digitToIntOrNull() ?: continue
+-            if (d !in 0..9) continue
+-
+-            var next = curr.children[d]
+-            if (next == null) {
+-                next = Node()
+-                curr.children[d] = next
+-            }
+-            curr = next
+-        }
+-        curr.addIndex(wordIndex.id)
+-    }
+-
+-    fun search(codePrefix: String, maxResults: Int = 100): IntArray {
+-        var curr = root
+-        for (ch in codePrefix) {
+-            val d = ch.digitToIntOrNull() ?: return IntArray(0)
+-            if (d !in 0..9) return IntArray(0)
+-
+-            curr = curr.children[d] ?: return IntArray(0)
+-        }
+-
+-        val result = IntArray(maxResults)
+-        var count = 0
+-
+-        fun collect(node: Node) {
+-            for (idx in node.candidateIndices) {
+-                if (count >= maxResults) return
+-                if (!result.contains(idx)) {
+-                    result[count++] = idx
+-                }
+-            }
+-            for (child in node.children) {
+-                if (child != null && count < maxResults) {
+-                    collect(child)
+-                }
+-            }
+-        }
+-
+-        collect(curr)
+-        return result.copyOf(count)
+-    }
+-}
+-
+ class T9Service : InputMethodService() {
+ 
+-    @Suppress("DEPRECATION")
+-    private val tr = Locale("tr", "TR")
++    private val tr = T9Keymap.tr
+     private val handler = Handler(Looper.getMainLooper())
+ 
+     private var BG = "#212121".toColorInt()
+@@ -143,17 +61,13 @@ class T9Service : InputMethodService() {
+     private var lightTheme = false
+     private lateinit var themePage: View
+     private lateinit var numPage: View
+-    private lateinit var dictPage: View
+     private var numActionLabel: TextView? = null
+ 
+-    private val groups = mapOf(
+-        '2' to "abcçâ", '3' to "def", '4' to "ghiığî", '5' to "jkl",
+-        '6' to "mnoö", '7' to "pqrsş", '8' to "tuvüû", '9' to "wxyz"
+-    )
+-    private val charToDigit: Map<Char, Char> =
+-        groups.flatMap { (d, s) -> s.map { it to d } }.toMap()
++    private val groups = T9Keymap.groups
++    private val charToDigit = T9Keymap.charToDigit
++
++    private fun codeOf(w: String) = T9Keymap.codeOf(w)
+ 
+-    private var dd = DictData()
+     private val words: ArrayList<String> get() = dd.words
+     private val codes: ArrayList<String> get() = dd.codes
+     private val wordSet: HashSet<String> get() = dd.wordSet
+@@ -171,6 +85,7 @@ class T9Service : InputMethodService() {
+     private var learnedSinceSave = 0
+     private var lastUc = ""
+     private val prefs by lazy { getSharedPreferences("t9", MODE_PRIVATE) }
++    private var dd = DictData(this, { prefs }, handler)
+     private var voiceInputEnabled: Boolean
+         get() = prefs.getBoolean("voice_input_enabled", true)
+         set(v) = prefs.edit { putBoolean("voice_input_enabled", v) }
+@@ -245,9 +160,7 @@ class T9Service : InputMethodService() {
+     private var selectMode = false
+     private var autoSpaced = false
+     private val spacePunct = setOf(".", ",", "?", "!", ":", ";")
+-    private var lastClip: String? = null
+-    private val clipboard by lazy { getSystemService(CLIPBOARD_SERVICE) as ClipboardManager }
+-    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { captureClip(true) }
++    private val clipManager by lazy { ClipManager(this) { currentInputEditorInfo } }
+     private var predView: TextView? = null
+     private var shiftIcon: IconView? = null
+     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+@@ -293,17 +206,11 @@ class T9Service : InputMethodService() {
+             }
+         }
+ 
+-        try {
+-            clipboard.addPrimaryClipChangedListener(clipListener)
+-        } catch (_: Exception) {
+-        }
++        clipManager.start()
+     }
+ 
+     override fun onDestroy() {
+-        try {
+-            clipboard.removePrimaryClipChangedListener(clipListener)
+-        } catch (_: Exception) {
+-        }
++        clipManager.stop()
+         serviceScope.cancel()
+         super.onDestroy()
+     }
+@@ -320,6 +227,7 @@ class T9Service : InputMethodService() {
+             recentUnknownWord = keep
+             updateSuggestions()
+         }
++        updatePredLook()
+         if (::pages.isInitialized) {
+             updateNumActionLabel(info)
+             if (!restarting) showPage(if (isNumericField(info)) numPage else t9Page, toggle = false)
+@@ -370,149 +278,8 @@ class T9Service : InputMethodService() {
+         updateSuggestions()
+     }
+ 
+-    private val codeBuffer = StringBuilder(32)
+-
+-    private fun codeOf(w: String): String {
+-        codeBuffer.setLength(0)
+-        for (i in 0 until w.length) {
+-            codeBuffer.append(charToDigit[w[i]] ?: '?')
+-        }
+-        return codeBuffer.toString()
+-    }
+-
+     private fun addWord(w: String) = dd.addWord(w)
+ 
+-    private inner class DictData {
+-        val words = ArrayList<String>()
+-        val codes = ArrayList<String>()
+-        val wordSet = HashSet<String>()
+-        val builtinBigrams = HashMap<String, ArrayList<String>>()
+-        val userCount = HashMap<String, Int>()
+-        val suffixCount = HashMap<String, Int>()
+-        val wordIdx = HashMap<String, Int>()
+-        val bigram = HashMap<String, Int>()
+-        val charTotal = HashMap<Char, Int>()
+-        val userBigram = HashMap<String, HashMap<String, Int>>()
+-        val userWords = HashSet<String>()
+-
+-        val t9Trie = T9Trie()
+-        var uc = ""
+-
+-        fun addWord(w: String) {
+-            if (w.isEmpty() || !w.all { charToDigit.containsKey(it) }) return
+-            if (!wordSet.add(w)) return
+-            val index = words.size
+-            wordIdx[w] = index
+-            words.add(w)
+-
+-            val codeStr = codeOf(w)
+-            codes.add(codeStr)
+-
+-            t9Trie.insert(T9Code(codeStr), WordIndex(index))
+-
+-            addSuffixes(w)
+-            addLetterStats(w)
+-        }
+-
+-        private fun addSuffixes(w: String) {
+-            for (len in 1..4) if (w.length > len) {
+-                val k = w.takeLast(len)
+-                suffixCount[k] = (suffixCount[k] ?: 0) + 1
+-            }
+-        }
+-
+-        private fun addLetterStats(w: String) {
+-            var prev = '^'
+-            for (c in w) {
+-                val k = "$prev$c"
+-                bigram[k] = (bigram[k] ?: 0) + 1
+-                charTotal[prev] = (charTotal[prev] ?: 0) + 1
+-                prev = c
+-            }
+-        }
+-
+-        fun loadBase() {
+-            var loaded = false
+-            try {
+-                val binaryReader = BinaryDictionaryReader(this@T9Service, "words_tr.bin")
+-                if (binaryReader.open()) {
+-                    val entries = binaryReader.readAllEntries()
+-                    if (entries.isNotEmpty()) {
+-                        entries.forEach { addWord(it.word) }
+-                        loaded = true
+-                    }
+-                }
+-            } catch (e: Exception) {
+-                e.printStackTrace()
+-            }
+-
+-            if (!loaded) {
+-                val list = ArrayList<Pair<String, Long>>()
+-                var hasFreq = false
+-                try {
+-                    assets.open("words_tr.txt").bufferedReader().useLines { ls ->
+-                        ls.forEach { line ->
+-                            val t = line.trim()
+-                            if (t.isNotEmpty()) {
+-                                val parts = t.split(' ', '\t', ',', ';').filter { it.isNotEmpty() }
+-                                val f = parts.getOrNull(1)?.toLongOrNull()
+-                                if (f != null) hasFreq = true
+-                                list.add(parts[0].lowercase(tr) to (f ?: 0L))
+-                            }
+-                        }
+-                    }
+-                } catch (e: Exception) {
+-                }
+-                if (list.isNotEmpty()) {
+-                    val ordered = if (hasFreq) list.sortedByDescending { it.second } else list
+-                    ordered.forEach { addWord(it.first) }
+-                } else {
+-                    DEFAULT_WORDS.split(" ").forEach { addWord(it) }
+-                }
+-            }
+-
+-            DEFAULT_BIGRAMS.split(";").forEach { e ->
+-                val p = e.split(":")
+-                if (p.size == 2) builtinBigrams.getOrPut(p[0]) { ArrayList() }
+-                    .addAll(p[1].split(","))
+-            }
+-        }
+-
+-        fun loadUser(migrate: Boolean) {
+-            try {
+-                uc = prefs.getString("uc", "") ?: ""
+-                uc.lines().forEach { l ->
+-                    val p = l.split('\t')
+-                    if (p.size == 2) {
+-                        val c = p[1].toIntOrNull()
+-                        if (c != null) {
+-                            val builtin = migrate && wordSet.contains(p[0])
+-                            userCount[p[0]] = c
+-                            if (!builtin) {
+-                                userWords.add(p[0]); addWord(p[0])
+-                            }
+-                        }
+-                    }
+-                }
+-                (prefs.getString("lc", "") ?: "").lines().forEach { l ->
+-                    val p = l.split('\t')
+-                    if (p.size == 2) {
+-                        val c = p[1].toIntOrNull()
+-                        if (c != null && !userCount.containsKey(p[0])) userCount[p[0]] = c
+-                    }
+-                }
+-                (prefs.getString("ub", "") ?: "").lines().forEach { l ->
+-                    val p = l.split('\t')
+-                    if (p.size == 3) {
+-                        val c = p[2].toIntOrNull()
+-                        if (c != null) userBigram.getOrPut(p[0]) { HashMap() }[p[1]] = c
+-                    }
+-                }
+-            } catch (e: Exception) {
+-            }
+-        }
+-    }
+-
+     private fun loadDictionary() {
+         dd.loadBase()
+     }
+@@ -558,10 +325,11 @@ class T9Service : InputMethodService() {
+         if (rebuilding) return
+         rebuilding = true
+         serviceScope.launch(Dispatchers.IO) {
+-            val nd = DictData()
++            val nd = DictData(this@T9Service, { prefs }, handler)
+             try {
+                 nd.loadBase(); nd.loadUser(false)
+             } catch (e: Exception) {
++                Log.w(TAG, "Sözlük yeniden oluşturulamadı", e)
+             }
+             withContext(Dispatchers.Main) {
+                 rebuilding = false
+@@ -986,7 +754,7 @@ class T9Service : InputMethodService() {
+         if (!voiceInputEnabled) {
+             android.widget.Toast.makeText(
+                 this,
+-                "Sesle yazma kapalı",
++                getString(R.string.voice_input_disabled),
+                 android.widget.Toast.LENGTH_SHORT
+             ).show()
+             return
+@@ -1018,10 +786,11 @@ class T9Service : InputMethodService() {
+                 }
+             }
+         } catch (e: Exception) {
++            Log.w(TAG, "Sesle yazma yöntemi aranırken hata", e)
+         }
+         android.widget.Toast.makeText(
+             this,
+-            "Google sesle yazma bulunamadı.",
++            getString(R.string.voice_input_not_found),
+             android.widget.Toast.LENGTH_LONG
+         ).show()
+         try {
+@@ -1031,6 +800,7 @@ class T9Service : InputMethodService() {
+                 )
+             )
+         } catch (e: Exception) {
++            Log.w(TAG, "Giriş yöntemi ayarları açılamadı", e)
+         }
+     }
+ 
+@@ -1193,6 +963,7 @@ class T9Service : InputMethodService() {
+         try {
+             android.provider.UserDictionary.Words.addWord(this, w, 250, null, null)
+         } catch (e: Exception) {
++            Log.w(TAG, "Sistem sözlüğüne kelime eklenemedi", e)
+         }
+         recentUnknownWord = null
+         if (silent) return
+@@ -1340,8 +1111,28 @@ class T9Service : InputMethodService() {
+         }
+     }
+ 
++    // Şifre / e-posta / URI alanlarında ve "öneri yok" bayraklı alanlarda tahmin (T9) kullanılmaz;
++    // tuşlar otomatik olarak çoklu dokunuşla (multi-tap) çalışır. Kullanıcının tahmin seçimi (predictive) korunur.
++    private fun predictionBlockedField(): Boolean {
++        val t = currentInputEditorInfo?.inputType ?: return false
++        if ((t and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return false
++        if ((t and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0) return true
++        return when (t and InputType.TYPE_MASK_VARIATION) {
++            InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
++            InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
++            InputType.TYPE_TEXT_VARIATION_URI,
++            InputType.TYPE_TEXT_VARIATION_PASSWORD,
++            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
++            InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> true
++
++            else -> false
++        }
++    }
++
++    private fun predictiveEffective(): Boolean = predictive && !predictionBlockedField()
++
+     private fun updatePredLook() {
+-        predView?.setTextColor(if (predictive) ACCENT else SUBTXT)
++        predView?.setTextColor(if (predictiveEffective()) ACCENT else SUBTXT)
+     }
+ 
+     private fun pickCandidateLetter(ch: Char) {
+@@ -1378,7 +1169,6 @@ class T9Service : InputMethodService() {
+             hideOrReturnTool.setTextColor(if (isReturn) ACCENT else ICON)
+         }
+         if (target === clipPage) refreshClips()
+-        if (target === dictPage) refreshDictList()
+     }
+ 
+     private fun menuAction(id: Int) {
+@@ -1491,7 +1281,7 @@ class T9Service : InputMethodService() {
+             onLong = { typeText(digit) }) {
+             when {
+                 digit == "1" -> tapSymbolKey()
+-                predictive -> tapPredictive(digit[0])
++                predictiveEffective() -> tapPredictive(digit[0])
+                 else -> tapMulti(label, chars)
+             }
+         }
+@@ -2009,23 +1799,6 @@ class T9Service : InputMethodService() {
+         return page
+     }
+ 
+-    private fun captureClip(force: Boolean) {
+-        try {
+-            val c = clipboard.primaryClip ?: return
+-            if (c.itemCount == 0) return
+-            if (c.description?.extras?.getBoolean(
+-                    "android.content.extra.IS_SENSITIVE",
+-                    false
+-                ) == true
+-            ) return
+-            val t = c.getItemAt(0).coerceToText(this)?.toString() ?: return
+-            if (!force && t == lastClip) return
+-            lastClip = t
+-            if (t.isNotBlank() && t.length <= 5000) ClipStore.add(this, t)
+-        } catch (e: Exception) {
+-        }
+-    }
+-
+     private fun openClipEditor(text: String?, pinned: Boolean) {
+         val i = Intent(this, ClipEditActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+         if (text != null) {
+@@ -2116,7 +1889,7 @@ class T9Service : InputMethodService() {
+ 
+     private fun refreshClips() {
+         if (!::clipLeft.isInitialized) return
+-        captureClip(false)
++        clipManager.capture(false)
+         clipLeft.removeAllViews()
+         clipRight.removeAllViews()
+         var hl = 0
+@@ -2326,215 +2099,6 @@ class T9Service : InputMethodService() {
+         return page
+     }
+ 
+-    private lateinit var dictContainer: LinearLayout
+-    private lateinit var dictCountHeader: TextView
+-    private lateinit var dictQueryDisplay: TextView
+-    private lateinit var dictActionAdd: TextView
+-    private lateinit var dictActionEdit: TextView
+-    private lateinit var dictActionDel: TextView
+-    private val dictQueryText = StringBuilder()
+-    private var dictWords: List<UserWord> = emptyList()
+-    private var dictLimit = 40
+-
+-    private var dictLastKey = ' '
+-    private var dictLastKeyTime = 0L
+-    private var dictMultiTapIdx = 0
+-
+-    private val dictMultiTapMap = mapOf(
+-        '1' to "1@.-_",
+-        '2' to "abcçâ2",
+-        '3' to "def3",
+-        '4' to "ghiığî4",
+-        '5' to "jkl5",
+-        '6' to "mnoö6",
+-        '7' to "pqrsş7",
+-        '8' to "tuvüû8",
+-        '9' to "wxyz9",
+-        '0' to " 0"
+-    )
+-
+-    private fun onDictKeyTap(key: Char) {
+-        val chars = dictMultiTapMap[key] ?: return
+-        val now = SystemClock.uptimeMillis()
+-        if (key == dictLastKey && now - dictLastKeyTime < 750L && dictQueryText.isNotEmpty()) {
+-            dictMultiTapIdx = (dictMultiTapIdx + 1) % chars.length
+-            dictQueryText.setCharAt(dictQueryText.length - 1, chars[dictMultiTapIdx])
+-        } else {
+-            dictLastKey = key
+-            dictMultiTapIdx = 0
+-            dictQueryText.append(chars[0])
+-        }
+-        dictLastKeyTime = now
+-        updateDictQueryDisplay()
+-    }
+-
+-    private fun onDictBackspace() {
+-        if (dictQueryText.isNotEmpty()) {
+-            dictQueryText.deleteCharAt(dictQueryText.length - 1)
+-            dictLastKey = ' '
+-            updateDictQueryDisplay()
+-        }
+-    }
+-
+-    private fun onDictClear() {
+-        dictQueryText.setLength(0)
+-        dictLastKey = ' '
+-        updateDictQueryDisplay()
+-    }
+-
+-    private fun updateDictQueryDisplay() {
+-        if (!::dictQueryDisplay.isInitialized) return
+-        val q = dictQueryText.toString()
+-        dictQueryDisplay.text = q.ifEmpty { "🔍 Ara..." }
+-        dictQueryDisplay.setTextColor(if (q.isEmpty()) SUBTXT else TXT)
+-        dictLimit = 40
+-        updateDictActionButtons()
+-        refreshDictList(reload = false)
+-    }
+-
+-    private fun updateDictActionButtons() {
+-        if (!::dictActionAdd.isInitialized) return
+-        val q = dictQueryText.toString().trim().lowercase(tr)
+-        if (q.length >= 2) {
+-            val exactExists = dictWords.any { it.word.lowercase(tr) == q }
+-            if (exactExists) {
+-                dictActionAdd.visibility = View.GONE
+-                dictActionEdit.visibility = View.VISIBLE
+-                dictActionDel.visibility = View.VISIBLE
+-            } else {
+-                dictActionAdd.visibility = View.VISIBLE
+-                dictActionEdit.visibility = View.GONE
+-                dictActionDel.visibility = View.GONE
+-            }
+-        } else {
+-            dictActionAdd.visibility = View.GONE
+-            dictActionEdit.visibility = View.GONE
+-            dictActionDel.visibility = View.GONE
+-        }
+-    }
+-
+-    private fun removeUserWord(w: String) {
+-        val clean = w.lowercase(tr)
+-        saveUserData()
+-        UserDictionaryStore.remove(this, clean)
+-        rebuildDictionary()
+-        refreshDictList()
+-    }
+-
+-    private fun addUserWordFromInput(w: String) {
+-        val clean = w.lowercase(tr)
+-        if (clean.length < 2) {
+-            android.widget.Toast.makeText(
+-                this,
+-                "Kelime en az 2 harfli olmalıdır",
+-                android.widget.Toast.LENGTH_SHORT
+-            ).show()
+-            return
+-        }
+-        addToDictionary(clean, silent = false)
+-        onDictClear()
+-        refreshDictList()
+-    }
+-
+-    @SuppressLint("SetTextI18n")
+-    private fun refreshDictList(reload: Boolean = true) {
+-        if (!::dictContainer.isInitialized) return
+-        dictContainer.removeAllViews()
+-        if (reload) dictWords = UserDictionaryStore.load(this)
+-        val allUserWords = dictWords
+-        if (::dictCountHeader.isInitialized) {
+-            dictCountHeader.text = "SÖZLÜK (${allUserWords.size} Kelime)"
+-        }
+-
+-        val query = dictQueryText.toString().trim().lowercase(tr)
+-        val filtered = if (query.isEmpty()) allUserWords else allUserWords.filter {
+-            it.word.lowercase(tr).contains(query)
+-        }
+-
+-        if (filtered.isEmpty()) {
+-            val emptyTv = TextView(this).apply {
+-                text =
+-                    if (allUserWords.isEmpty()) "Henüz sözlüğe eklenmiş özel bir kelime yok." else "Aramaya uygun kelime bulunamadı."
+-                textSize = 13f
+-                setTextColor(SUBTXT)
+-                gravity = Gravity.CENTER
+-                setPadding(0, dp(16), 0, dp(16))
+-            }
+-            dictContainer.addView(emptyTv, LinearLayout.LayoutParams(MATCH_PARENT, -2))
+-            return
+-        }
+-
+-        filtered.take(dictLimit).forEach { item ->
+-            val card = LinearLayout(this).apply {
+-                orientation = LinearLayout.HORIZONTAL
+-                gravity = Gravity.CENTER_VERTICAL
+-                background = GradientDrawable().apply {
+-                    setColor(Color.parseColor("#21262B"))
+-                    cornerRadius = dp(6).toFloat()
+-                }
+-                setPadding(dp(10), dp(6), dp(10), dp(6))
+-            }
+-
+-            val textInfo = LinearLayout(this).apply {
+-                orientation = LinearLayout.VERTICAL
+-            }
+-
+-            val wordTv = TextView(this).apply {
+-                text = item.word
+-                textSize = 15f
+-                setTextColor(TXT)
+-            }
+-
+-            val countTv = TextView(this).apply {
+-                text = "${item.count}x kullanıldı"
+-                textSize = 11f
+-                setTextColor(SUBTXT)
+-            }
+-
+-            textInfo.addView(wordTv)
+-            textInfo.addView(countTv)
+-
+-            val btnEdit = TextView(this).apply {
+-                text = "✏️"
+-                textSize = 16f
+-                setPadding(dp(8), dp(4), dp(8), dp(4))
+-                setOnClickListener {
+-                    dictQueryText.setLength(0)
+-                    dictQueryText.append(item.word)
+-                    dictLastKey = ' '
+-                    updateDictQueryDisplay()
+-                }
+-            }
+-
+-            val btnDel = TextView(this).apply {
+-                text = "🗑️"
+-                textSize = 16f
+-                setPadding(dp(8), dp(4), dp(8), dp(4))
+-                setOnClickListener {
+-                    removeUserWord(item.word)
+-                }
+-            }
+-
+-            card.addView(textInfo, LinearLayout.LayoutParams(0, -2, 1f))
+-            card.addView(btnEdit)
+-            card.addView(btnDel)
+-
+-            val lp =
+-                LinearLayout.LayoutParams(MATCH_PARENT, -2).apply { setMargins(0, 0, 0, dp(4)) }
+-            dictContainer.addView(card, lp)
+-        }
+-        if (filtered.size > dictLimit) {
+-            dictContainer.addView(TextView(this).apply {
+-                text = "Daha fazla göster (${filtered.size - dictLimit})"
+-                textSize = 13f
+-                setTextColor(ACCENT)
+-                gravity = Gravity.CENTER
+-                setPadding(0, dp(10), 0, dp(10))
+-                setOnClickListener { dictLimit += 40; refreshDictList(reload = false) }
+-            }, LinearLayout.LayoutParams(MATCH_PARENT, -2))
+-        }
+-    }
+-
+     private fun openUserDictionaryActivity() {
+         saveUserData()
+         val i =
+@@ -2542,239 +2106,6 @@ class T9Service : InputMethodService() {
+         startActivity(i)
+     }
+ 
+-    private fun buildDictPage(): View {
+-        val page = FrameLayout(this)
+-        val rootLayout = LinearLayout(this).apply {
+-            orientation = LinearLayout.VERTICAL
+-            setPadding(dp(8), dp(4), dp(8), dp(4))
+-        }
+-
+-        val topBar = LinearLayout(this).apply {
+-            orientation = LinearLayout.HORIZONTAL
+-            gravity = Gravity.CENTER_VERTICAL
+-        }
+-
+-        dictCountHeader = TextView(this).apply {
+-            text = "SÖZLÜK"
+-            textSize = 14f
+-            setTextColor(TXT)
+-            gravity = Gravity.CENTER_VERTICAL
+-        }
+-
+-        val btnFull = TextView(this).apply {
+-            text = "📱 Tam Ekran"
+-            textSize = 13f
+-            setTextColor(ACCENT)
+-            setPadding(dp(8), dp(4), dp(8), dp(4))
+-            setOnClickListener { openUserDictionaryActivity() }
+-        }
+-
+-        val btnBack = TextView(this).apply {
+-            text = "↩ Geri"
+-            textSize = 13f
+-            setTextColor(ACCENT)
+-            setPadding(dp(8), dp(4), dp(8), dp(4))
+-            setOnClickListener { showPage(settingsPage) }
+-        }
+-
+-        topBar.addView(dictCountHeader, LinearLayout.LayoutParams(0, -2, 1f))
+-        topBar.addView(btnFull)
+-        topBar.addView(btnBack)
+-        rootLayout.addView(topBar, LinearLayout.LayoutParams(MATCH_PARENT, -2))
+-
+-        val inputBar = LinearLayout(this).apply {
+-            orientation = LinearLayout.HORIZONTAL
+-            gravity = Gravity.CENTER_VERTICAL
+-            setPadding(0, dp(2), 0, dp(4))
+-        }
+-
+-        dictQueryDisplay = TextView(this).apply {
+-            text = "🔍 Ara..."
+-            textSize = 13f
+-            setTextColor(SUBTXT)
+-            isSingleLine = true
+-            ellipsize = android.text.TextUtils.TruncateAt.END
+-            background = GradientDrawable().apply {
+-                setColor(Color.parseColor("#1C2024"))
+-                cornerRadius = dp(6).toFloat()
+-            }
+-            setPadding(dp(8), dp(6), dp(8), dp(6))
+-        }
+-
+-        dictActionAdd = TextView(this).apply {
+-            text = "+ Ekle"
+-            textSize = 12f
+-            setTextColor(Color.WHITE)
+-            background = GradientDrawable().apply {
+-                setColor(ACCENT_DARK)
+-                cornerRadius = dp(6).toFloat()
+-            }
+-            setPadding(dp(8), dp(6), dp(8), dp(6))
+-            visibility = View.GONE
+-            setOnClickListener {
+-                val q = dictQueryText.toString().trim()
+-                if (q.isNotBlank()) addUserWordFromInput(q)
+-            }
+-        }
+-
+-        dictActionEdit = TextView(this).apply {
+-            text = "✏️"
+-            textSize = 14f
+-            setPadding(dp(8), dp(6), dp(4), dp(6))
+-            visibility = View.GONE
+-            setOnClickListener {
+-                val q = dictQueryText.toString().trim().lowercase(tr)
+-                val allUserWords = UserDictionaryStore.load(this@T9Service)
+-                val match = allUserWords.firstOrNull { it.word.lowercase(tr) == q }
+-                if (match != null) {
+-                    dictQueryText.setLength(0)
+-                    dictQueryText.append(match.word)
+-                    dictLastKey = ' '
+-                    updateDictQueryDisplay()
+-                }
+-            }
+-        }
+-
+-        dictActionDel = TextView(this).apply {
+-            text = "🗑️"
+-            textSize = 14f
+-            setPadding(dp(4), dp(6), dp(8), dp(6))
+-            visibility = View.GONE
+-            setOnClickListener {
+-                val q = dictQueryText.toString().trim().lowercase(tr)
+-                removeUserWord(q)
+-                onDictClear()
+-            }
+-        }
+-
+-        val btnDelChar = TextView(this).apply {
+-            text = "⌫"
+-            textSize = 14f
+-            setTextColor(TXT)
+-            background = GradientDrawable().apply {
+-                setColor(DIM)
+-                cornerRadius = dp(6).toFloat()
+-            }
+-            setPadding(dp(8), dp(6), dp(8), dp(6))
+-            setOnClickListener { onDictBackspace() }
+-        }
+-
+-        val btnClear = TextView(this).apply {
+-            text = "✕"
+-            textSize = 14f
+-            setTextColor(TXT)
+-            background = GradientDrawable().apply {
+-                setColor(DIM)
+-                cornerRadius = dp(6).toFloat()
+-            }
+-            setPadding(dp(8), dp(6), dp(8), dp(6))
+-            setOnClickListener { onDictClear() }
+-        }
+-
+-        inputBar.addView(dictQueryDisplay, LinearLayout.LayoutParams(0, -2, 1f))
+-        inputBar.addView(
+-            dictActionAdd,
+-            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, 0, 0) })
+-        inputBar.addView(
+-            dictActionEdit,
+-            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, 0, 0) })
+-        inputBar.addView(
+-            dictActionDel,
+-            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(2), 0, 0, 0) })
+-        inputBar.addView(
+-            btnDelChar,
+-            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, 0, 0) })
+-        inputBar.addView(
+-            btnClear,
+-            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, 0, 0) })
+-        rootLayout.addView(inputBar, LinearLayout.LayoutParams(MATCH_PARENT, -2))
+-
+-        val scroll = ScrollView(this)
+-        dictContainer = LinearLayout(this).apply {
+-            orientation = LinearLayout.VERTICAL
+-            setPadding(0, dp(2), 0, dp(4))
+-        }
+-        scroll.addView(dictContainer, FrameLayout.LayoutParams(MATCH_PARENT, -2))
+-        rootLayout.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+-
+-        val keypad = LinearLayout(this).apply {
+-            orientation = LinearLayout.VERTICAL
+-            setPadding(0, dp(4), 0, 0)
+-        }
+-
+-        fun makeDictKey(label: String, sub: String, keyChar: Char): View {
+-            return FrameLayout(this).apply {
+-                background = GradientDrawable().apply {
+-                    setColor(KEY)
+-                    cornerRadius = dp(6).toFloat()
+-                }
+-                setOnClickListener { onDictKeyTap(keyChar) }
+-                val box = LinearLayout(context).apply {
+-                    orientation = LinearLayout.VERTICAL
+-                    gravity = Gravity.CENTER
+-                }
+-                val tvMain = TextView(context).apply {
+-                    text = label
+-                    textSize = 14f
+-                    setTextColor(TXT)
+-                    gravity = Gravity.CENTER
+-                }
+-                val tvSub = TextView(context).apply {
+-                    text = sub
+-                    textSize = 9f
+-                    setTextColor(SUBTXT)
+-                    gravity = Gravity.CENTER
+-                }
+-                box.addView(tvMain)
+-                if (sub.isNotEmpty()) box.addView(tvSub)
+-                addView(box, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER))
+-            }
+-        }
+-
+-        val rows = listOf(
+-            listOf(Triple("1", "@.-", '1'), Triple("2", "abcçâ", '2'), Triple("3", "def", '3')),
+-            listOf(Triple("4", "ghiığî", '4'), Triple("5", "jkl", '5'), Triple("6", "mnoö", '6')),
+-            listOf(Triple("7", "pqrsş", '7'), Triple("8", "tuvüû", '8'), Triple("9", "wxyz", '9'))
+-        )
+-
+-        rows.forEach { rowSpec ->
+-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+-            rowSpec.forEach { (lbl, sub, keyChar) ->
+-                val v = makeDictKey(lbl, sub, keyChar)
+-                row.addView(
+-                    v,
+-                    LinearLayout.LayoutParams(0, dp(34), 1f)
+-                        .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+-            }
+-            keypad.addView(row)
+-        }
+-
+-        val lastRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+-        val btnSpace = FrameLayout(this).apply {
+-            background = GradientDrawable().apply {
+-                setColor(KEY)
+-                cornerRadius = dp(6).toFloat()
+-            }
+-            setOnClickListener { onDictKeyTap('0') }
+-            addView(TextView(context).apply {
+-                text = "␣ Boşluk"
+-                textSize = 12f
+-                setTextColor(TXT)
+-                gravity = Gravity.CENTER
+-            }, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER))
+-        }
+-        lastRow.addView(
+-            btnSpace,
+-            LinearLayout.LayoutParams(0, dp(32), 1f)
+-                .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+-        keypad.addView(lastRow)
+-
+-        rootLayout.addView(keypad, LinearLayout.LayoutParams(MATCH_PARENT, -2))
+-
+-        page.addView(rootLayout, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+-        return page
+-    }
+-
+     private fun isNumericField(info: EditorInfo?): Boolean {
+         val cls = (info?.inputType ?: 0) and InputType.TYPE_MASK_CLASS
+         return cls == InputType.TYPE_CLASS_NUMBER ||
+@@ -2890,6 +2221,7 @@ class T9Service : InputMethodService() {
+                 w.decorView
+             ).isAppearanceLightNavigationBars = lightTheme
+         } catch (e: Exception) {
++            Log.w(TAG, "Gezinti çubuğu görünümü ayarlanamadı", e)
+         }
+     }
+ 
+@@ -2994,7 +2326,9 @@ class T9Service : InputMethodService() {
+         }
+ 
+         val hideBtn = tool("⌄") {
+-            if (::t9Page.isInitialized && t9Page.visibility != View.VISIBLE && numPage.visibility != View.VISIBLE) {
++            if (::t9Page.isInitialized && ::numPage.isInitialized &&
++                t9Page.visibility != View.VISIBLE && numPage.visibility != View.VISIBLE
++            ) {
+                 showPage(t9Page)
+             } else {
+                 requestHideSelf(0)
+@@ -3050,7 +2384,6 @@ class T9Service : InputMethodService() {
+         settingsPage = buildSettingsPage()
+         themePage = buildThemePage()
+         numPage = buildNumPage()
+-        dictPage = buildDictPage()
+         pages = listOf(
+             t9Page,
+             sym1,
+@@ -3060,8 +2393,7 @@ class T9Service : InputMethodService() {
+             clipPage,
+             settingsPage,
+             themePage,
+-            numPage,
+-            dictPage
++            numPage
+         )
+         val content = FrameLayout(this)
+         contentLayoutView = content
+@@ -3268,6 +2600,7 @@ class T9Service : InputMethodService() {
+     }
+ 
+     private companion object {
++        const val TAG = "T9Service"
+         val SUFFIXES =
+             ("lar ler da de dan den ın in un ün a e ı i u ü ya ye yı yi yu yü nın nin nun nün " +
+                     "la le ım im um üm sı si su sü ta te tan ten dı di du dü tı ti tu tü mı mi mu mü lı li lu lü " +
+@@ -3282,261 +2615,5 @@ class T9Service : InputMethodService() {
+                 "🌸 🌳 🍎 🍕 🍔 🍟 ☕ 🍺 🍷 ⚽ 🏀 🎮 🎵 🎶 📱 💻 📷 🚗 ✈️ 🏠 💰 🎁 📞 " +
+                 "✅ ❌ ⚠️ 💯 👋 🤝 ✌️ 👌 🤞 👀 💋 💐 🌈 ☔"
+ 
+-        const val DEFAULT_BIGRAMS =
+-            "merhaba:nasılsın,hoş,canım;selam:nasılsın,canım;nasılsın:iyiyim,nasıl;" +
+-                    "nereye:gidiyorsun,gidiyoruz,gidiyor;nerede:buluşuyoruz,kaldın;neredesin:ben,şimdi;" +
+-                    "ne:yapıyorsun,zaman,var,yaptın;nasıl:gidiyor,bir,yani;teşekkür:ederim,ederiz;" +
+-                    "sağ:ol;iyi:akşamlar,geceler,günler,misin;günaydın:canım,nasılsın;hoş:geldin,bulduk;" +
+-                    "görüşürüz:canım,kendine;kendine:iyi;çok:güzel,teşekkürler,iyi;bir:şey,saniye,dakika;" +
+-                    "ben:de,şimdi,geliyorum;sen:de,nerdesin;bugün:ne,nasıl,akşam;yarın:görüşürüz,görüşelim,sabah;" +
+-                    "tamam:canım,olur,görüşürüz;lütfen:bana,beni;özür:dilerim;şimdi:geliyorum,müsait,gidiyorum;" +
+-                    "evet:tabii,kesinlikle,ben;hayır:değil,olmaz;aşkım:nasılsın,ne;canım:benim,nasılsın"
+-
+-        const val DEFAULT_WORDS =
+-            "bir bu ve da de için ne çok ama daha var gibi ben sen o biz siz onlar evet hayır " +
+-                    "değil mi ki en kadar sonra şimdi nasıl neden nerede nereye nereden kim kime hangi şey her hiç bile " +
+-                    "ile ya ise çünkü yani tamam merhaba selam nasılsın iyiyim teşekkürler teşekkür ederim sağol rica " +
+-                    "lütfen özür dilerim günaydın akşamlar geceler hoş geldin görüşürüz hadi haydi bak bakalım olur " +
+-                    "olmaz olmuş oldu olacak olarak olan gel gelmek geliyorum geliyor geldi gelecek git gitmek " +
+-                    "gidiyorum gidiyorsun gidiyor gidiyoruz gitti gideceğim yap yapmak yapıyorum yapıyorsun yaptım " +
+-                    "yapacağım ver vermek al almak bul bulmak söyle söylemek biliyorum bilmiyorum biliyor istiyorum " +
+-                    "istiyorsun istiyor istemiyorum sevgilim canım aşkım güzel kötü iyi büyük küçük yeni eski bugün " +
+-                    "yarın dün şu an akşam sabah öğle gece hafta ay yıl saat dakika zaman gün ev iş okul araba yol " +
+-                    "para su yemek çay kahve ekmek telefon mesaj arıyorum arıyorsun arayacağım ara görmek görüyorum " +
+-                    "gördüm göreceğim bekle bekliyorum bekliyor geliyorsun nerdesin neredesin yapıyorsun napıyorsun " +
+-                    "kaç kaçta nerde burada orada şurada buraya oraya bana sana ona bize size onlara benim senin onun " +
+-                    "bizim sizin onların beni seni onu bizi sizi onları benimle seninle onunla bizimle sizinle " +
+-                    "müsait müsaitsin buluşalım buluşuruz buluşuyoruz kaldın kaldım yoldayım yoldayız geç geç kaldım " +
+-                    "erken geç acil önemli sorun yok var mı tabii tabi kesinlikle belki galiba sanırım herhalde " +
+-                    "aslında özellikle sadece bile hem hem de veya ya da fakat ancak üzgünüm mutlu mutluyum yorgunum " +
+-                    "acıktım susadım uyuyorum uyudum uyanık hasta iyileş geçmiş olsun doğum günü kutlu olsun " +
+-                    "bayram tebrik ederim kolay zor güzel güzeldi harika süper mükemmel berbat fena değil " +
+-                    "anne baba kardeş abi abla amca teyze dayı hala arkadaş dost eş çocuk bebek aile " +
+-                    "toplantı ders sınav ödev proje rapor dosya belge mail eposta mesajı gönder gönderdim " +
+-                    "göndereceğim aldım aldık verdim verdik yaptık yapalım gidelim gelelim bakalım konuşalım " +
+-                    "konuşuruz konuşuyoruz anlıyorum anladım anlamadım tekrar bir daha lütfen tekrar söyle " +
+-                    "doğru yanlış evet tamamdır peki olur mu olmuyor olabilir olmaz mı hayırlı olsun " +
+-                    "inşallah maşallah selamün aleyküm aleyküm selam allah'a emanet kendine iyi bak"
+-    }
+-}
+-
+-class IconView @JvmOverloads constructor(
+-    context: Context,
+-    private var kind: Int = 0,
+-    private var iconColor: Int = Color.WHITE,
+-    private var strokeWidthPx: Float = 4f
+-) : View(context) {
+-
+-    companion object {
+-        const val SHIFT_OFF = 0
+-        const val SHIFT_ON = 1
+-        const val SHIFT_CAPS = 2
+-        const val ENTER = 3
+-        const val MIC = 4
+-        const val UP = 5
+-        const val DOWN = 6
+-        const val LEFT = 7
+-        const val RIGHT = 8
+-        const val SPACE = 9
+-        const val CURSOR = 10
+-    }
+-
+-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-        style = Paint.Style.STROKE
+-        strokeCap = Paint.Cap.ROUND
+-        strokeJoin = Paint.Join.ROUND
+-    }
+-
+-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-        style = Paint.Style.FILL
+-    }
+-
+-    private val path = Path()
+-    private val tempRect = RectF()
+-
+-    fun setLook(kind: Int, color: Int) {
+-        this.kind = kind
+-        this.iconColor = color
+-        invalidate()
+-    }
+-
+-    override fun onDraw(canvas: Canvas) {
+-        super.onDraw(canvas)
+-        strokePaint.color = iconColor
+-        strokePaint.strokeWidth = strokeWidthPx
+-        fillPaint.color = iconColor
+-
+-        val cx = width / 2f
+-        val cy = height / 2f
+-        val size =
+-            min(width - paddingLeft - paddingRight, height - paddingTop - paddingBottom) * 0.5f
+-        if (size <= 0f) return
+-
+-        when (kind) {
+-            SHIFT_OFF -> {
+-                path.reset()
+-                path.moveTo(cx, cy - size * 0.5f)
+-                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.45f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.45f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
+-                path.close()
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            SHIFT_ON -> {
+-                path.reset()
+-                path.moveTo(cx, cy - size * 0.5f)
+-                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.45f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.45f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
+-                path.close()
+-                canvas.drawPath(path, fillPaint)
+-            }
+-
+-            SHIFT_CAPS -> {
+-                path.reset()
+-                path.moveTo(cx, cy - size * 0.5f)
+-                path.lineTo(cx + size * 0.35f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx + size * 0.18f, cy + size * 0.35f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.35f)
+-                path.lineTo(cx - size * 0.18f, cy + size * 0.05f)
+-                path.lineTo(cx - size * 0.35f, cy + size * 0.05f)
+-                path.close()
+-                canvas.drawPath(path, fillPaint)
+-                canvas.drawLine(
+-                    cx - size * 0.35f,
+-                    cy + size * 0.5f,
+-                    cx + size * 0.35f,
+-                    cy + size * 0.5f,
+-                    strokePaint
+-                )
+-            }
+-
+-            ENTER -> {
+-                path.reset()
+-                path.moveTo(cx + size * 0.35f, cy - size * 0.35f)
+-                path.lineTo(cx + size * 0.35f, cy + size * 0.1f)
+-                path.lineTo(cx - size * 0.3f, cy + size * 0.1f)
+-                canvas.drawPath(path, strokePaint)
+-                path.reset()
+-                path.moveTo(cx - size * 0.1f, cy - size * 0.1f)
+-                path.lineTo(cx - size * 0.3f, cy + size * 0.1f)
+-                path.lineTo(cx - size * 0.1f, cy + size * 0.3f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            MIC -> {
+-                tempRect.set(cx - size * 0.18f, cy - size * 0.45f, cx + size * 0.18f, cy + size * 0.1f)
+-                canvas.drawRoundRect(tempRect, size * 0.18f, size * 0.18f, strokePaint)
+-                tempRect.set(
+-                    cx - size * 0.32f,
+-                    cy - size * 0.15f,
+-                    cx + size * 0.32f,
+-                    cy + size * 0.25f
+-                )
+-                canvas.drawArc(tempRect, 0f, 180f, false, strokePaint)
+-                canvas.drawLine(cx, cy + size * 0.25f, cx, cy + size * 0.45f, strokePaint)
+-                canvas.drawLine(
+-                    cx - size * 0.2f,
+-                    cy + size * 0.45f,
+-                    cx + size * 0.2f,
+-                    cy + size * 0.45f,
+-                    strokePaint
+-                )
+-            }
+-
+-            UP -> {
+-                path.reset()
+-                path.moveTo(cx - size * 0.35f, cy + size * 0.2f)
+-                path.lineTo(cx, cy - size * 0.2f)
+-                path.lineTo(cx + size * 0.35f, cy + size * 0.2f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            DOWN -> {
+-                path.reset()
+-                path.moveTo(cx - size * 0.35f, cy - size * 0.2f)
+-                path.lineTo(cx, cy + size * 0.2f)
+-                path.lineTo(cx + size * 0.35f, cy - size * 0.2f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            LEFT -> {
+-                path.reset()
+-                path.moveTo(cx + size * 0.2f, cy - size * 0.35f)
+-                path.lineTo(cx - size * 0.2f, cy)
+-                path.lineTo(cx + size * 0.2f, cy + size * 0.35f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            RIGHT -> {
+-                path.reset()
+-                path.moveTo(cx - size * 0.2f, cy - size * 0.35f)
+-                path.lineTo(cx + size * 0.2f, cy)
+-                path.lineTo(cx - size * 0.2f, cy + size * 0.35f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            SPACE -> {
+-                path.reset()
+-                path.moveTo(cx - size * 0.4f, cy - size * 0.15f)
+-                path.lineTo(cx - size * 0.4f, cy + size * 0.15f)
+-                path.lineTo(cx + size * 0.4f, cy + size * 0.15f)
+-                path.lineTo(cx + size * 0.4f, cy - size * 0.15f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-
+-            CURSOR -> {
+-                path.reset()
+-                path.moveTo(cx - size * 0.15f, cy - size * 0.15f)
+-                path.lineTo(cx, cy - size * 0.35f)
+-                path.lineTo(cx + size * 0.15f, cy - size * 0.15f)
+-                path.moveTo(cx - size * 0.15f, cy + size * 0.15f)
+-                path.lineTo(cx, cy + size * 0.35f)
+-                path.lineTo(cx + size * 0.15f, cy + size * 0.15f)
+-                path.moveTo(cx - size * 0.15f, cy - size * 0.15f)
+-                path.lineTo(cx - size * 0.35f, cy)
+-                path.lineTo(cx - size * 0.15f, cy + size * 0.15f)
+-                path.moveTo(cx + size * 0.15f, cy - size * 0.15f)
+-                path.lineTo(cx + size * 0.35f, cy)
+-                path.lineTo(cx + size * 0.15f, cy + size * 0.15f)
+-                canvas.drawPath(path, strokePaint)
+-            }
+-        }
+     }
+ }
+-
+-class JoystickView(context: Context) : View(context) {
+-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-        style = Paint.Style.FILL
+-        color = "#2E3236".toColorInt()
+-    }
+-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-        style = Paint.Style.STROKE
+-        strokeWidth = 3f * context.resources.displayMetrics.density
+-        color = "#5FD3C5".toColorInt()
+-    }
+-    private val knobPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-        style = Paint.Style.FILL
+-        color = "#5FD3C5".toColorInt()
+-    }
+-
+-    override fun onDraw(canvas: Canvas) {
+-        super.onDraw(canvas)
+-        val cx = width / 2f
+-        val cy = height / 2f
+-        val radius = min(cx, cy) - strokePaint.strokeWidth
+-        if (radius <= 0f) return
+-
+-        canvas.drawCircle(cx, cy, radius, bgPaint)
+-        canvas.drawCircle(cx, cy, radius, strokePaint)
+-        canvas.drawCircle(cx, cy, radius * 0.35f, knobPaint)
+-    }
+-}
+\ No newline at end of file
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/T9Trie.kt b/app/src/main/java/com/example/comexamplet9keyboard/T9Trie.kt
+new file mode 100644
+index 0000000..ffa3003
+--- /dev/null
++++ b/app/src/main/java/com/example/comexamplet9keyboard/T9Trie.kt
+@@ -0,0 +1,75 @@
++package com.example.comexamplet9keyboard
++
++// ==========================================
++// OPTİMİZE EDİLMİŞ RAM VE CPU DOSTU T9 TRIE
++// ==========================================
++@JvmInline
++value class T9Code(val value: String)
++
++@JvmInline
++value class WordIndex(val id: Int)
++
++class T9Trie {
++    class Node {
++        // HashMap nesne maliyetini önlemek için sabit 10 elemanlı dizi (0-9 tuşları)
++        val children = arrayOfNulls<Node>(10)
++
++        // Boxing maliyetini önlemek için IntArray
++        var candidateIndices = IntArray(0)
++
++        fun addIndex(index: Int) {
++            if (!candidateIndices.contains(index)) {
++                candidateIndices += index
++            }
++        }
++    }
++
++    val root = Node()
++
++    fun insert(code: T9Code, wordIndex: WordIndex) {
++        var curr = root
++        val str = code.value
++        for (ch in str) {
++            val d = ch.digitToIntOrNull() ?: continue
++            if (d !in 0..9) continue
++
++            var next = curr.children[d]
++            if (next == null) {
++                next = Node()
++                curr.children[d] = next
++            }
++            curr = next
++        }
++        curr.addIndex(wordIndex.id)
++    }
++
++    fun search(codePrefix: String, maxResults: Int = 100): IntArray {
++        var curr = root
++        for (ch in codePrefix) {
++            val d = ch.digitToIntOrNull() ?: return IntArray(0)
++            if (d !in 0..9) return IntArray(0)
++
++            curr = curr.children[d] ?: return IntArray(0)
++        }
++
++        val result = IntArray(maxResults)
++        var count = 0
++
++        fun collect(node: Node) {
++            for (idx in node.candidateIndices) {
++                if (count >= maxResults) return
++                // Not: result sıfırlarla başlar; contains() kontrolü 0 numaralı kelimeyi hep atlıyordu.
++                // Bir kelime ağaçta tek bir düğümde durduğundan (Node.addIndex tekrarı engeller) ek kontrol gerekmez.
++                result[count++] = idx
++            }
++            for (child in node.children) {
++                if (child != null && count < maxResults) {
++                    collect(child)
++                }
++            }
++        }
++
++        collect(curr)
++        return result.copyOf(count)
++    }
++}
+diff --git a/app/src/main/java/com/example/comexamplet9keyboard/UserDictionaryStore.kt b/app/src/main/java/com/example/comexamplet9keyboard/UserDictionaryStore.kt
+index 97d635a..62666da 100644
+--- a/app/src/main/java/com/example/comexamplet9keyboard/UserDictionaryStore.kt
++++ b/app/src/main/java/com/example/comexamplet9keyboard/UserDictionaryStore.kt
+@@ -35,9 +35,23 @@ object UserDictionaryStore {
+                 sb.append(word.trim()).append('\t').append(count).append('\n')
+             }
+         }
++        // putString("") boş listeyi de yazar; son kelime silindiğinde anahtar güncellenir.
+         prefs.edit { putString(PREF_KEY_UC, sb.toString()) }
+     }
+ 
++    // Sistem sözlüğünden (best-effort) siler. WRITE_USER_DICTIONARY izni olmayan cihazlarda
++    // SecurityException fırlatılır; bu durum sessizce yok sayılır ve klavyenin kendi sözlüğünü etkilemez.
++    private fun removeFromSystemDictionary(context: Context, word: String) {
++        try {
++            context.contentResolver.delete(
++                android.provider.UserDictionary.Words.CONTENT_URI,
++                "${android.provider.UserDictionary.Words.WORD}=?",
++                arrayOf(word)
++            )
++        } catch (_: Exception) {
++        }
++    }
++
+     fun add(context: Context, word: String, count: Int = 1): Boolean {
+         val clean = word.trim().lowercase(trLocale)
+         if (clean.length < 2) return false
+@@ -73,6 +87,7 @@ object UserDictionaryStore {
+                 current.add(UserWord(newClean, existingCount))
+             }
+             save(context, current)
++            removeFromSystemDictionary(context, oldClean)
+             return true
+         }
+         return false
+@@ -82,5 +97,6 @@ object UserDictionaryStore {
+         val clean = word.trim().lowercase(trLocale)
+         val current = load(context).filter { (w) -> w.lowercase(trLocale) != clean }
+         save(context, current)
++        removeFromSystemDictionary(context, clean)
+     }
+ }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 01a17e1..39e982b 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -9,4 +9,10 @@
+     <string name="splash_desc_2">🎯 Pratik ve sade: tek elle bile rahat kullanım.</string>
+     <string name="splash_desc_3">📖 Kişisel kullanıcı sözlüğü: kendi özel kelimelerinizi ekleyin ve yönetin.</string>
+     <string name="splash_desc_4">🧠 Akıllı tahmin: yazdıkça kelimeyi sizin yerinize bulur.</string>
++
++    <string name="voice_input_disabled">Sesle yazma kapalı</string>
++    <string name="voice_input_not_found">Google sesle yazma bulunamadı.</string>
++    <string name="dictionary_load_failed">Sözlük dosyası okunamadı, yedek sözlük kullanılıyor.</string>
++    <string name="clip_edit_title">Pano kartı</string>
++    <string name="user_dictionary_title">Kullanıcı Sözlüğü</string>
+ </resources>
+diff --git a/app/src/test/java/com/example/comexamplet9keyboard/ExampleUnitTest.kt b/app/src/test/java/com/example/comexamplet9keyboard/ExampleUnitTest.kt
+index 853eaa4..1fb734d 100644
+--- a/app/src/test/java/com/example/comexamplet9keyboard/ExampleUnitTest.kt
++++ b/app/src/test/java/com/example/comexamplet9keyboard/ExampleUnitTest.kt
+@@ -1,10 +1,14 @@
+ package com.example.comexamplet9keyboard
+ 
++import org.junit.Ignore
+ import org.junit.Test
+ import java.io.File
+ import java.net.URL
+ 
++// Not: Aşağıdaki iki test geliştirici aracıdır; asset dosyalarının üzerine yazar (ve biri internete bağlanır).
++// Rutin `gradlew test` çalıştırmalarında sözlüğü bozmaması için @Ignore'dur. Gerektiğinde bilerek açın.
+ class ExampleUnitTest {
++    @Ignore("Geliştirici aracı: words_tr.txt dosyasının üzerine yazar ve internete bağlanır")
+     @Test
+     fun mergeDictionary() {
+         val assetFile = File("src/main/assets/words_tr.txt")
+@@ -43,6 +47,7 @@ class ExampleUnitTest {
+         }
+     }
+ 
++    @Ignore("Geliştirici aracı: words_tr.bin dosyasının üzerine yazar")
+     @Test
+     fun generateBinaryDictionary() {
+         val txtFile = File("src/main/assets/words_tr.txt")
+diff --git a/app/src/test/java/com/example/comexamplet9keyboard/T9KeymapTest.kt b/app/src/test/java/com/example/comexamplet9keyboard/T9KeymapTest.kt
+new file mode 100644
+index 0000000..0555409
+--- /dev/null
++++ b/app/src/test/java/com/example/comexamplet9keyboard/T9KeymapTest.kt
+@@ -0,0 +1,66 @@
++package com.example.comexamplet9keyboard
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++import java.nio.ByteBuffer
++
++class T9KeymapTest {
++
++    @Test
++    fun basicWordsMapToExpectedCodes() {
++        assertEquals("247", T9Keymap.codeOf("bir"))
++        assertEquals("4663", T9Keymap.codeOf("gone"))
++        assertEquals("6363", T9Keymap.codeOf("mene"))
++    }
++
++    @Test
++    fun turkishLettersShareKeysWithTheirBaseLetters() {
++        assertEquals(T9Keymap.codeOf("cok"), T9Keymap.codeOf("çok"))
++        assertEquals(T9Keymap.codeOf("sen"), T9Keymap.codeOf("şen"))
++        assertEquals(T9Keymap.codeOf("gul"), T9Keymap.codeOf("gül"))
++        assertEquals(T9Keymap.codeOf("ogun"), T9Keymap.codeOf("öğün"))
++        assertEquals(T9Keymap.codeOf("kiz"), T9Keymap.codeOf("kız"))
++    }
++
++    @Test
++    fun unknownCharactersBecomeQuestionMark() {
++        assertEquals("2?3", T9Keymap.codeOf("a1d"))
++        assertNull(T9Keymap.charToDigit['1'])
++    }
++
++    @Test
++    fun emptyWordHasEmptyCode() {
++        assertEquals("", T9Keymap.codeOf(""))
++    }
++
++    @Test
++    fun everyLetterGroupIsCoveredByCharToDigit() {
++        T9Keymap.groups.forEach { (digit, letters) ->
++            letters.forEach { assertEquals(digit, T9Keymap.charToDigit[it]) }
++        }
++    }
++
++    // words_tr.bin: 36 baytlık kayıtlar, frekansa göre azalan sırada olmalı (yükleme sırası buna dayanır).
++    @Test
++    fun binaryDictionaryIsWellFormedAndSortedByFrequency() {
++        val f = File("src/main/assets/words_tr.bin")
++        if (!f.exists()) return
++        val bytes = f.readBytes()
++        assertEquals(0, bytes.size % BinaryDictionaryReader.RECORD_SIZE)
++        val buf = ByteBuffer.wrap(bytes)
++        var prev = Int.MAX_VALUE
++        var first: String? = null
++        for (i in 0 until bytes.size / BinaryDictionaryReader.RECORD_SIZE) {
++            val off = i * BinaryDictionaryReader.RECORD_SIZE
++            val word = String(bytes, off, BinaryDictionaryReader.WORD_SIZE, Charsets.UTF_8).trimEnd('\u0000')
++            val freq = buf.getInt(off + BinaryDictionaryReader.WORD_SIZE)
++            if (first == null) first = word
++            assertTrue("Frekans sırası bozuk: kayıt $i ($word)", freq <= prev)
++            prev = freq
++        }
++        assertEquals("bir", first)
++    }
++}
+diff --git a/app/src/test/java/com/example/comexamplet9keyboard/T9TrieTest.kt b/app/src/test/java/com/example/comexamplet9keyboard/T9TrieTest.kt
+new file mode 100644
+index 0000000..eba3d42
+--- /dev/null
++++ b/app/src/test/java/com/example/comexamplet9keyboard/T9TrieTest.kt
+@@ -0,0 +1,65 @@
++package com.example.comexamplet9keyboard
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class T9TrieTest {
++
++    private fun trie(vararg entries: Pair<String, Int>) = T9Trie().apply {
++        entries.forEach { (code, idx) -> insert(T9Code(code), WordIndex(idx)) }
++    }
++
++    @Test
++    fun exactCodeReturnsInsertedWord() {
++        val t = trie("4663" to 0)
++        assertArrayEquals(intArrayOf(0), t.search("4663"))
++    }
++
++    @Test
++    fun prefixReturnsLongerWords() {
++        val t = trie("46" to 0, "466" to 1, "4663" to 2)
++        // Önce tam eşleşme, sonra daha uzun kodlar gelir
++        assertArrayEquals(intArrayOf(0, 1, 2), t.search("46"))
++    }
++
++    @Test
++    fun sameCodeKeepsInsertionOrder() {
++        // Aynı tuş dizisi: ekleme sırası (= sözlükteki frekans sırası) korunmalı
++        val t = trie("4663" to 5, "4663" to 2, "4663" to 9)
++        assertArrayEquals(intArrayOf(5, 2, 9), t.search("4663"))
++    }
++
++    @Test
++    fun duplicateIndexIsNotAddedTwice() {
++        val t = trie("22" to 1, "22" to 1)
++        assertArrayEquals(intArrayOf(1), t.search("22"))
++    }
++
++    @Test
++    fun unknownPrefixReturnsEmpty() {
++        val t = trie("22" to 1)
++        assertEquals(0, t.search("99").size)
++    }
++
++    @Test
++    fun nonDigitQueryReturnsEmpty() {
++        val t = trie("22" to 1)
++        assertEquals(0, t.search("2a").size)
++    }
++
++    @Test
++    fun maxResultsIsRespected() {
++        val t = T9Trie()
++        for (i in 0 until 50) t.insert(T9Code("2"), WordIndex(i))
++        assertEquals(10, t.search("2", maxResults = 10).size)
++    }
++
++    @Test
++    fun emptyPrefixSearchesWholeTrie() {
++        val t = trie("2" to 0, "3" to 1)
++        val r = t.search("")
++        assertTrue(r.contains(0) && r.contains(1))
++    }
++}

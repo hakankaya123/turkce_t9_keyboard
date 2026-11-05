@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">T9 KlavyeTR</string>
+    <string name="app_description">Hızlı, pratik ve modern Türkçe T9 akıllı klavye uygulaması</string>
+    <string name="subtype_label">Türkçe</string>
+
+    <string name="splash_title">T9 KlavyeTR</string>
+    <string name="splash_tagline">Daha az dokun, daha hızlı yaz.</string>
+    <string name="splash_desc_1">⚡ Işık hızında yazım: az tuşla çok kelime.</string>
+    <string name="splash_desc_2">🎯 Pratik ve sade: tek elle bile rahat kullanım.</string>
+    <string name="splash_desc_3">📖 Kişisel kullanıcı sözlüğü: kendi özel kelimelerinizi ekleyin ve yönetin.</string>
+    <string name="splash_desc_4">🧠 Akıllı tahmin: yazdıkça kelimeyi sizin yerinize bulur.</string>
+
+    <string name="voice_input_disabled">Sesle yazma kapalı</string>
+    <string name="voice_input_not_found">Google sesle yazma bulunamadı.</string>
+    <string name="dictionary_load_failed">Sözlük dosyası okunamadı, yedek sözlük kullanılıyor.</string>
+    <string name="clip_edit_title">Pano kartı</string>
+    <string name="user_dictionary_title">Kullanıcı Sözlüğü</string>
+</resources>
