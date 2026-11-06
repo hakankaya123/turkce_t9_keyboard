@@ -159,7 +159,7 @@ class T9Service : InputMethodService() {
     private lateinit var hideOrReturnTool: TextView
     private var selectMode = false
     private var autoSpaced = false
-    private val spacePunct = setOf(".", ",", "?", "!", ":", ";")
+    private val spacePunct = setOf(".", ",", "?", "!", ":", ";", "…")
     private val clipManager by lazy { ClipManager(this) { currentInputEditorInfo } }
     private var predView: TextView? = null
     private var shiftIcon: IconView? = null
@@ -806,16 +806,25 @@ class T9Service : InputMethodService() {
 
     private fun shouldAutoSpace(ic: InputConnection, s: String): Boolean {
         val t = currentInputEditorInfo?.inputType ?: 0
-        if ((t and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return false
-        when (t and InputType.TYPE_MASK_VARIATION) {
-            InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
-            InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
-            InputType.TYPE_TEXT_VARIATION_URI,
-            InputType.TYPE_TEXT_VARIATION_PASSWORD,
-            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
-            InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> return false
+        // Sayı, telefon ve tarih/saat alanlarında boşluk eklenmez. Sınıfı belirtmeyen (TYPE_NULL) özel
+        // sohbet kutuları (ör. Gemini) metin alanı gibi davranır.
+        when (t and InputType.TYPE_MASK_CLASS) {
+            InputType.TYPE_CLASS_NUMBER,
+            InputType.TYPE_CLASS_PHONE,
+            InputType.TYPE_CLASS_DATETIME -> return false
         }
-        if ((t and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0) return false
+        if ((t and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT) {
+            when (t and InputType.TYPE_MASK_VARIATION) {
+                InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
+                InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
+                InputType.TYPE_TEXT_VARIATION_URI,
+                InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
+                InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> return false
+            }
+        }
+        // Not: TYPE_TEXT_FLAG_NO_SUGGESTIONS bilerek denetlenmez. Bu bayrak yalnızca öneri/düzeltme
+        // istemediğini söyler; sohbet uygulamaları (ör. Gemini) kullanır ama noktalamadan sonra boşluk beklenir.
         val recent = ic.getTextBeforeCursor(40, 0)?.toString() ?: ""
         if (recent.contains("@") || recent.contains("www.") || recent.contains(".com") || recent.contains(
                 ".net"
@@ -1111,16 +1120,16 @@ class T9Service : InputMethodService() {
         }
     }
 
-    // Şifre / e-posta / URI alanlarında ve "öneri yok" bayraklı alanlarda tahmin (T9) kullanılmaz;
-    // tuşlar otomatik olarak çoklu dokunuşla (multi-tap) çalışır. Kullanıcının tahmin seçimi (predictive) korunur.
+    // Yalnızca şifre ve e-posta alanlarında tahmin (T9) kullanılmaz; tuşlar otomatik olarak çoklu dokunuşla
+    // (multi-tap) çalışır. Kullanıcının tahmin seçimi (predictive) korunur.
+    // Not: URI (tarayıcı adres çubuğu) ve TYPE_TEXT_FLAG_NO_SUGGESTIONS bilerek engellenmez; Chrome, Opera ve
+    // sistem arama kutuları bu bayrakları kullandığı halde kullanıcı orada T9 ile yazmak ister.
     private fun predictionBlockedField(): Boolean {
         val t = currentInputEditorInfo?.inputType ?: return false
         if ((t and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return false
-        if ((t and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0) return true
         return when (t and InputType.TYPE_MASK_VARIATION) {
             InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
             InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
-            InputType.TYPE_TEXT_VARIATION_URI,
             InputType.TYPE_TEXT_VARIATION_PASSWORD,
             InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
             InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> true
